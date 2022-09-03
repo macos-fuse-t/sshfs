@@ -10,8 +10,8 @@ if DARWIN_COMPAT
 sshfs_SOURCES += compat/darwin_compat.c compat/darwin_compat.h
 endif
 
-sshfs_LDADD = $(SSHFS_LIBS)
-sshfs_CFLAGS = $(SSHFS_CFLAGS)
+sshfs_LDADD = $(SSHFS_LIBS) -L/usr/local/lib -lfuse-t
+sshfs_CFLAGS = $(SSHFS_CFLAGS) -D_FILE_OFFSET_BITS=64 -I/usr/local/include/fuse
 sshfs_CPPFLAGS = -D_REENTRANT -DFUSE_USE_VERSION=26 -DLIBDIR=\"$(libdir)\" \
                  -DIDMAP_DEFAULT="\"$(IDMAP_DEFAULT)\""
 
