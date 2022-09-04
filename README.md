@@ -50,7 +50,7 @@ sftp(1) and ssh_config(5)), including the remote port number
 
 To unmount the filesystem:
 
-    fusermount -u mountpoint
+    umount mountpoint
 
 
 Installing
@@ -62,6 +62,7 @@ http://github.com/libfuse/libfuse.
 You also need to install the devel package for glib2.0.  After
 installing FUSE, compile sshfs the usual way:
 
+    autoreconf -vfi
     ./configure
     make
     make install (as root)
