@@ -45,7 +45,33 @@ endif
 configure_file(output: 'config.h',
                configuration : cfg)
 
-sshfs_deps = [ dependency('fuse3', version: '>= 3.1.0'),
+if target_machine.system() == 'darwin'
+  fuse3_dep = dependency('fuse3', required: true)
+  fuse3_api_probe = '''
+    #define FUSE_USE_VERSION 31
+    #include <fuse.h>
+    #include <fuse_lowlevel.h>
+
+    int main(void) {
+      struct fuse_args *args = 0;
+      struct fuse *fuse = fuse_new(args, 0, 0, 0);
+      struct fuse_session *se = 0;
+      int (*loop_fn)(struct fuse *, int) = fuse_loop_mt_31;
+
+      (void) loop_fn;
+      return fuse_mount(fuse, "/") + fuse_session_fd(se);
+    }
+  '''
+  if not cc.compiles(fuse3_api_probe,
+                     dependencies: fuse3_dep,
+                     args: ['-DFUSE_USE_VERSION=31'])
+    error('Darwin fuse3 dependency does not expose the libfuse3 API required by sshfs')
+  endif
+else
+  fuse3_dep = dependency('fuse3', version: '>= 3.1.0')
+endif
+
+sshfs_deps = [ fuse3_dep,
                dependency('glib-2.0'),
                dependency('gthread-2.0') ]
 
