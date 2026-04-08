@@ -959,7 +959,8 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 }
 
 static int buf_get_entries(struct buffer *buf, void *dbuf,
-                           fuse_fill_dir_t filler)
+                           fuse_fill_dir_t filler,
+                           enum fuse_fill_dir_flags fill_flags)
 {
 	uint32_t count;
 	unsigned i;
@@ -982,7 +983,7 @@ static int buf_get_entries(struct buffer *buf, void *dbuf,
 				    S_ISLNK(stbuf.st_mode)) {
 					stbuf.st_mode = 0;
 				}
-				filler(dbuf, name, &stbuf, 0, 0);
+				filler(dbuf, name, &stbuf, 0, fill_flags);
 			}
 		}
 		free(name);
@@ -2267,7 +2268,8 @@ static int sshfs_req_pending(struct request *req)
 }
 
 static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
-			      void *buf, off_t offset, fuse_fill_dir_t filler)
+			      void *buf, off_t offset, fuse_fill_dir_t filler,
+			      enum fuse_fill_dir_flags fill_flags)
 {
 	int err = 0;
 	int outstanding = 0;
@@ -2327,7 +2329,7 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 				done = 1;
 			}
 			if (!done) {
-				err = buf_get_entries(&name, buf, filler);
+				err = buf_get_entries(&name, buf, filler, fill_flags);
 				buf_free(&name);
 
 				/* increase number of outstanding requests */
@@ -2345,7 +2347,8 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 }
 
 static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
-			     void *buf, off_t offset, fuse_fill_dir_t filler)
+			     void *buf, off_t offset, fuse_fill_dir_t filler,
+			     enum fuse_fill_dir_flags fill_flags)
 {
 	int err;
 	assert(offset == 0);
@@ -2353,7 +2356,7 @@ static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
 		struct buffer name;
 		err = sftp_request(conn, SSH_FXP_READDIR, handle, SSH_FXP_NAME, &name);
 		if (!err) {
-			err = buf_get_entries(&name, buf, filler);
+			err = buf_get_entries(&name, buf, filler, fill_flags);
 			buf_free(&name);
 		}
 	} while (!err);
@@ -2399,15 +2402,16 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 	(void) path; (void) flags;
 	int err;
 	struct dir_handle *handle;
+	enum fuse_fill_dir_flags fill_flags = FUSE_FILL_DIR_PLUS;
 
 	handle = (struct dir_handle*) fi->fh;
 
 	if (sshfs.sync_readdir)
 		err = sftp_readdir_sync(handle->conn, &handle->buf, dbuf,
-					offset, filler);
+					offset, filler, fill_flags);
 	else
 		err = sftp_readdir_async(handle->conn, &handle->buf, dbuf,
-					 offset, filler);
+					 offset, filler, fill_flags);
 
 	return err;
 }
