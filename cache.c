@@ -40,7 +40,6 @@ static struct cache cache;
 
 struct node {
 	struct stat stat;
-	int stat_negative;
 	time_t stat_valid;
 	GPtrArray *dir;
 	time_t dir_valid;
@@ -195,24 +194,6 @@ void cache_add_attr(const char *path, const struct stat *stbuf, uint64_t wrctr)
 	if (wrctr == cache.write_ctr) {
 		node = cache_get(path);
 		node->stat = *stbuf;
-		node->stat_negative = 0;
-		node->stat_valid = time(NULL) + cache.stat_timeout_secs;
-		if (node->stat_valid > node->valid)
-			node->valid = node->stat_valid;
-		cache_clean();
-	}
-	pthread_mutex_unlock(&cache.lock);
-}
-
-static void cache_add_negative_attr(const char *path, uint64_t wrctr)
-{
-	struct node *node;
-
-	pthread_mutex_lock(&cache.lock);
-	if (wrctr == cache.write_ctr) {
-		node = cache_get(path);
-		memset(&node->stat, 0, sizeof(node->stat));
-		node->stat_negative = 1;
 		node->stat_valid = time(NULL) + cache.stat_timeout_secs;
 		if (node->stat_valid > node->valid)
 			node->valid = node->stat_valid;
@@ -269,64 +250,13 @@ static int cache_get_attr(const char *path, struct stat *stbuf)
 	if (node != NULL) {
 		time_t now = time(NULL);
 		if (node->stat_valid - now >= 0) {
-			if (node->stat_negative) {
-				err = -ENOENT;
-			} else {
-				*stbuf = node->stat;
-				err = 0;
-			}
+			*stbuf = node->stat;
+			err = 0;
 		}
 	}
 	pthread_mutex_unlock(&cache.lock);
 	return err;
 }
-
-static char *cache_fullpath(const char *dirpath, const char *name)
-{
-	const char *basepath = !dirpath[1] ? "" : dirpath;
-	return g_strdup_printf("%s/%s", basepath, name);
-}
-
-#ifdef __APPLE__
-static void cache_seed_appledouble_negatives(const char *path, GPtrArray *dir,
-					     uint64_t wrctr)
-{
-	GHashTable *names;
-	struct cache_dirent **cdent;
-
-	names = g_hash_table_new(g_str_hash, g_str_equal);
-	if (!names)
-		return;
-
-	for (cdent = (struct cache_dirent **) dir->pdata; *cdent != NULL; cdent++) {
-		g_hash_table_add(names, (*cdent)->name);
-	}
-
-	for (cdent = (struct cache_dirent **) dir->pdata; *cdent != NULL; cdent++) {
-		char *sidecar_name;
-		char *sidecar_path;
-		const char *name = (*cdent)->name;
-
-		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-			continue;
-		if (strncmp(name, "._", 2) == 0)
-			continue;
-
-		sidecar_name = g_strdup_printf("._%s", name);
-		if (g_hash_table_contains(names, sidecar_name)) {
-			g_free(sidecar_name);
-			continue;
-		}
-
-		sidecar_path = cache_fullpath(path, sidecar_name);
-		cache_add_negative_attr(sidecar_path, wrctr);
-		g_free(sidecar_path);
-		g_free(sidecar_name);
-	}
-
-	g_hash_table_destroy(names);
-}
-#endif
 
 uint64_t cache_get_write_ctr(void)
 {
@@ -355,7 +285,7 @@ static int cache_getattr(const char *path, struct stat *stbuf,
 			 struct fuse_file_info *fi)
 {
 	int err = cache_get_attr(path, stbuf);
-	if (err == -EAGAIN) {
+	if (err) {
 		uint64_t wrctr = cache_get_write_ctr();
 		err = cache.next_oper->getattr(path, stbuf, fi);
 		if (!err)
@@ -435,8 +365,9 @@ static int cache_dirfill (void *buf, const char *name,
 		g_ptr_array_add(ch->dir, cdent);
 		if (stbuf->st_mode & S_IFMT) {
 			char *fullpath;
+			const char *basepath = !ch->path[1] ? "" : ch->path;
 
-			fullpath = cache_fullpath(ch->path, name);
+			fullpath = g_strdup_printf("%s/%s", basepath, name);
 			cache_add_attr(fullpath, stbuf, ch->wrctr);
 			g_free(fullpath);
 		}
@@ -494,9 +425,6 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	g_ptr_array_add(ch.dir, NULL);
 	dir = ch.dir;
 	if (!err) {
-#ifdef __APPLE__
-		cache_seed_appledouble_negatives(path, dir, ch.wrctr);
-#endif
 		cache_add_dir(path, dir);
 	} else {
 		g_ptr_array_free(dir, TRUE);
