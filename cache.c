@@ -648,6 +648,25 @@ static int cache_utimens(const char *path, const struct timespec tv[2],
 	return err;
 }
 
+#if defined(__APPLE__) && defined(SETATTR_WANTS_MODE)
+static int cache_setattr_x(const char *path, struct setattr_x *attr)
+{
+	int err = cache.next_oper->setattr_x(path, attr);
+	if (!err)
+		cache_invalidate(path);
+	return err;
+}
+
+static int cache_fsetattr_x(const char *path, struct setattr_x *attr,
+			    struct fuse_file_info *fi)
+{
+	int err = cache.next_oper->fsetattr_x(path, attr, fi);
+	if (!err)
+		cache_invalidate(path);
+	return err;
+}
+#endif
+
 static int cache_write(const char *path, const char *buf, size_t size,
                        off_t offset, struct fuse_file_info *fi)
 {
@@ -708,6 +727,10 @@ static void cache_fill(struct fuse_operations *oper,
 	cache_oper->unlink   = oper->unlink ? cache_unlink : NULL;
 	cache_oper->utimens  = oper->utimens ? cache_utimens : NULL;
 	cache_oper->write    = oper->write ? cache_write : NULL;
+#if defined(__APPLE__) && defined(SETATTR_WANTS_MODE)
+	cache_oper->setattr_x = oper->setattr_x ? cache_setattr_x : NULL;
+	cache_oper->fsetattr_x = oper->fsetattr_x ? cache_fsetattr_x : NULL;
+#endif
 }
 
 struct fuse_operations *cache_wrap(struct fuse_operations *oper)

@@ -36,6 +36,7 @@
 #include <sys/utsname.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <glib.h>
@@ -2725,6 +2726,8 @@ static int sshfs_chown(const char *path, uid_t uid, gid_t gid,
 
 static int sshfs_truncate_workaround(const char *path, off_t size,
                                      struct fuse_file_info *fi);
+static int sshfs_getattr(const char *path, struct stat *stbuf,
+			 struct fuse_file_info *fi);
 
 static void sshfs_inc_modifver(void)
 {
@@ -2733,26 +2736,60 @@ static void sshfs_inc_modifver(void)
 	pthread_mutex_unlock(&sshfs.lock);
 }
 
+static void sshfs_timespec_to_time(const struct timespec *tv, time_t now,
+				   time_t *out)
+{
+	if (tv->tv_nsec == UTIME_NOW)
+		*out = now;
+	else
+		*out = tv->tv_sec;
+}
+
 static int sshfs_utimens(const char *path, const struct timespec tv[2],
 			 struct fuse_file_info *fi)
 {
-	(void) fi;
 	int err;
 	struct buffer buf;
+	struct stat stbuf;
 	struct sshfs_file *sf = NULL;
-	time_t asec = tv[0].tv_sec, msec = tv[1].tv_sec;
-
-	struct timeval now;
-	gettimeofday(&now, NULL);
-	if (asec == 0)
-		asec = now.tv_sec;
-	if (msec == 0)
-		msec = now.tv_sec;
+	time_t now = time(NULL);
+	time_t asec;
+	time_t msec;
 
 	if (fi != NULL) {
 		sf = get_sshfs_file(fi);
 		if (!sshfs_file_is_conn(sf))
 			return -EIO;
+	}
+
+	if (tv == NULL) {
+		asec = now;
+		msec = now;
+	} else {
+		if (tv[0].tv_nsec == UTIME_OMIT &&
+		    tv[1].tv_nsec == UTIME_OMIT)
+			return 0;
+
+		if (tv[0].tv_nsec == UTIME_OMIT ||
+		    tv[1].tv_nsec == UTIME_OMIT) {
+			err = sshfs_getattr(path, &stbuf, fi);
+			if (err)
+				return err;
+		}
+
+		if (tv[0].tv_nsec == UTIME_OMIT)
+			asec = stbuf.st_atime;
+		else if (tv[0].tv_sec == 0)
+			asec = now;
+		else
+			sshfs_timespec_to_time(&tv[0], now, &asec);
+
+		if (tv[1].tv_nsec == UTIME_OMIT)
+			msec = stbuf.st_mtime;
+		else if (tv[1].tv_sec == 0)
+			msec = now;
+		else
+			sshfs_timespec_to_time(&tv[1], now, &msec);
 	}
 
 	buf_init(&buf, 0);
@@ -3482,6 +3519,63 @@ static int sshfs_getattr(const char *path, struct stat *stbuf,
 	return err;
 }
 
+#if defined(__APPLE__) && defined(SETATTR_WANTS_MODE)
+static int sshfs_setattr_x_common(const char *path, struct setattr_x *attr,
+				  struct fuse_file_info *fi)
+{
+	int err;
+
+	if (SETATTR_WANTS_MODE(attr)) {
+		err = sshfs_chmod(path, attr->mode, fi);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_UID(attr) || SETATTR_WANTS_GID(attr)) {
+		uid_t uid = SETATTR_WANTS_UID(attr) ? attr->uid : (uid_t) -1;
+		gid_t gid = SETATTR_WANTS_GID(attr) ? attr->gid : (gid_t) -1;
+
+		err = sshfs_chown(path, uid, gid, fi);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_SIZE(attr)) {
+		err = sshfs_truncate(path, attr->size, fi);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_ACCTIME(attr) || SETATTR_WANTS_MODTIME(attr)) {
+		struct timespec tv[2];
+
+		tv[0] = attr->acctime;
+		tv[1] = attr->modtime;
+		if (!SETATTR_WANTS_ACCTIME(attr))
+			tv[0].tv_nsec = UTIME_OMIT;
+		if (!SETATTR_WANTS_MODTIME(attr))
+			tv[1].tv_nsec = UTIME_OMIT;
+
+		err = sshfs_utimens(path, tv, fi);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int sshfs_setattr_x(const char *path, struct setattr_x *attr)
+{
+	return sshfs_setattr_x_common(path, attr, NULL);
+}
+
+static int sshfs_fsetattr_x(const char *path, struct setattr_x *attr,
+			    struct fuse_file_info *fi)
+{
+	return sshfs_setattr_x_common(path, attr, fi);
+}
+#endif
+
 static int sshfs_truncate_zero(const char *path)
 {
 	int err;
@@ -3654,6 +3748,10 @@ static struct fuse_operations sshfs_oper = {
 		.write      = sshfs_write,
 		.statfs     = sshfs_statfs,
 		.create     = sshfs_create,
+#if defined(__APPLE__) && defined(SETATTR_WANTS_MODE)
+		.setattr_x  = sshfs_setattr_x,
+		.fsetattr_x = sshfs_fsetattr_x,
+#endif
 };
 
 static void usage(const char *progname)
