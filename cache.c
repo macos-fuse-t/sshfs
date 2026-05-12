@@ -8,7 +8,6 @@
 
 #include "cache.h"
 #include <stdio.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -63,6 +62,9 @@ struct file_handle {
 
 	/* If so, this will hold its handle */
 	unsigned long fs_fh;
+
+	/* Snapshot for offset-based continuations that were not globally cached. */
+	GPtrArray *dir;
 };
 
 struct cache_dirent {
@@ -359,13 +361,22 @@ static int cache_readdir_snapshot_changed(uint64_t namespace_ctr)
 }
 
 static void cache_readdir_fill_from_snapshot(void *buf, fuse_fill_dir_t filler,
-					     GPtrArray *dir)
+					     GPtrArray *dir, off_t offset)
 {
-	struct cache_dirent **cdent;
+	guint i;
 
-	for (cdent = (struct cache_dirent **) dir->pdata; *cdent != NULL; cdent++) {
-		if (filler(buf, (*cdent)->name, &(*cdent)->stat, 0,
-			   (*cdent)->flags))
+	if (offset < 0)
+		return;
+
+	if ((guint64) offset > G_MAXUINT)
+		return;
+
+	for (i = (guint) offset; i < dir->len; i++) {
+		struct cache_dirent *cdent = g_ptr_array_index(dir, i);
+		if (cdent == NULL)
+			break;
+		if (filler(buf, cdent->name, &cdent->stat, (off_t) i + 1,
+			   cdent->flags))
 			break;
 	}
 }
@@ -449,7 +460,39 @@ static int cache_opendir(const char *path, struct fuse_file_info *fi)
 	if(cfi == NULL)
 		return -ENOMEM;
 	cfi->is_open = 0;
+	cfi->dir = NULL;
 	fi->fh = (unsigned long) cfi;
+	return 0;
+}
+
+static int cache_release_underlying_dir(const char *path,
+					struct fuse_file_info *fi,
+					struct file_handle *cfi)
+{
+	int err = 0;
+
+	if (cfi->is_open) {
+		fi->fh = cfi->fs_fh;
+		if (cache.next_oper->releasedir)
+			err = cache.next_oper->releasedir(path, fi);
+		cfi->is_open = 0;
+		fi->fh = (unsigned long) cfi;
+	}
+	return err;
+}
+
+static int cache_open_underlying_dir(const char *path, struct fuse_file_info *fi,
+				     struct file_handle *cfi)
+{
+	int err = 0;
+
+	if (cache.next_oper->opendir) {
+		err = cache.next_oper->opendir(path, fi);
+		if (err)
+			return err;
+	}
+	cfi->is_open = 1;
+	cfi->fs_fh = fi->fh;
 	return 0;
 }
 
@@ -459,13 +502,9 @@ static int cache_releasedir(const char *path, struct fuse_file_info *fi)
 	struct file_handle *cfi;
 
 	cfi = (struct file_handle*) fi->fh;
-
-	if(cfi->is_open) {
-		fi->fh = cfi->fs_fh;
-		err = cache.next_oper->releasedir(path, fi);
-	} else
-		err = 0;
-
+	err = cache_release_underlying_dir(path, fi, cfi);
+	if (cfi->dir != NULL)
+		g_ptr_array_free(cfi->dir, TRUE);
 	free(cfi);
 	return err;
 }
@@ -497,67 +536,61 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	int err;
 	GPtrArray *dir;
 	struct node *node;
-	int retries = 0;
-	const int max_retries = 3;
 	int stable_snapshot = 0;
 
-	assert(offset == 0);
+	cfi = (struct file_handle*) fi->fh;
+	if (cfi->dir != NULL) {
+		cache_readdir_fill_from_snapshot(buf, filler, cfi->dir, offset);
+		return 0;
+	}
 
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
 	if (node != NULL && node->dir != NULL) {
 		time_t now = time(NULL);
 		if (node->dir_valid - now >= 0) {
-			cache_readdir_fill_from_snapshot(buf, filler, node->dir);
+			cache_readdir_fill_from_snapshot(buf, filler, node->dir,
+							 offset);
 			pthread_mutex_unlock(&cache.lock);
 			return 0;
 		}
 	}
 	pthread_mutex_unlock(&cache.lock);
 
-	cfi = (struct file_handle*) fi->fh;
-	if(cfi->is_open)
-		fi->fh = cfi->fs_fh;
-	else {
-		if(cache.next_oper->opendir) {
-			err = cache.next_oper->opendir(path, fi);
-			if(err)
-				return err;
-		}
-		cfi->is_open = 1;
-		cfi->fs_fh = fi->fh;
+	err = cache_release_underlying_dir(path, fi, cfi);
+	if (err)
+		return err;
+	err = cache_open_underlying_dir(path, fi, cfi);
+	if (err)
+		return err;
+
+	ch.path = path;
+	ch.dir = g_ptr_array_new();
+	g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
+	ch.wrctr = cache_get_write_ctr();
+	ch.namespace_ctr = cache_get_namespace_ctr();
+	err = cache.next_oper->readdir(path, &ch, cache_dirfill, 0, fi, flags);
+	g_ptr_array_add(ch.dir, NULL);
+	dir = ch.dir;
+	if (err) {
+		g_ptr_array_free(dir, TRUE);
+		cache_release_underlying_dir(path, fi, cfi);
+		return err;
 	}
 
-	for (;;) {
-		ch.path = path;
-		ch.dir = g_ptr_array_new();
-		g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
-		ch.wrctr = cache_get_write_ctr();
-		ch.namespace_ctr = cache_get_namespace_ctr();
-		err = cache.next_oper->readdir(path, &ch, cache_dirfill, offset, fi,
-					      flags);
-		g_ptr_array_add(ch.dir, NULL);
-		dir = ch.dir;
-		if (err) {
-			g_ptr_array_free(dir, TRUE);
-			return err;
-		}
-		if (!cache_readdir_snapshot_changed(ch.namespace_ctr)) {
-			stable_snapshot = 1;
-			break;
-		}
-		if (retries >= max_retries)
-			break;
+	err = cache_release_underlying_dir(path, fi, cfi);
+	if (err) {
 		g_ptr_array_free(dir, TRUE);
-		retries++;
+		return err;
 	}
+	stable_snapshot = !cache_readdir_snapshot_changed(ch.namespace_ctr);
 
 	if (!err) {
+		cache_readdir_fill_from_snapshot(buf, filler, dir, offset);
 		if (stable_snapshot)
 			cache_readdir_cache_snapshot(path, dir, ch.wrctr);
-		cache_readdir_fill_from_snapshot(buf, filler, dir);
-		if (!stable_snapshot)
-			g_ptr_array_free(dir, TRUE);
+		else
+			cfi->dir = dir;
 	}
 
 	return err;
