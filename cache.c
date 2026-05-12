@@ -34,7 +34,6 @@ struct cache {
 	pthread_mutex_t lock;
 	time_t last_cleaned;
 	uint64_t write_ctr;
-	uint64_t namespace_ctr;
 };
 
 static struct cache cache;
@@ -52,9 +51,10 @@ struct node {
 
 struct readdir_handle {
 	const char *path;
+	void *buf;
+	fuse_fill_dir_t filler;
 	GPtrArray *dir;
 	uint64_t wrctr;
-	uint64_t namespace_ctr;
 };
 
 struct file_handle {
@@ -68,7 +68,6 @@ struct file_handle {
 struct cache_dirent {
 	char *name;
 	struct stat stat;
-	enum fuse_fill_dir_flags flags;
 };
 
 static void free_node(gpointer node_)
@@ -153,7 +152,6 @@ static void cache_invalidate_dir(const char *path)
 	pthread_mutex_lock(&cache.lock);
 	cache_purge(path);
 	cache_purge_parent(path);
-	cache.namespace_ctr++;
 	pthread_mutex_unlock(&cache.lock);
 }
 
@@ -175,7 +173,6 @@ static void cache_do_rename(const char *from, const char *to)
 	cache_purge(to);
 	cache_purge_parent(from);
 	cache_purge_parent(to);
-	cache.namespace_ctr++;
 	pthread_mutex_unlock(&cache.lock);
 }
 
@@ -342,54 +339,6 @@ uint64_t cache_get_write_ctr(void)
 	return res;
 }
 
-static uint64_t cache_get_namespace_ctr(void)
-{
-	uint64_t res;
-
-	pthread_mutex_lock(&cache.lock);
-	res = cache.namespace_ctr;
-	pthread_mutex_unlock(&cache.lock);
-
-	return res;
-}
-
-static int cache_readdir_snapshot_changed(uint64_t namespace_ctr)
-{
-	return cache_get_namespace_ctr() != namespace_ctr;
-}
-
-static void cache_readdir_fill_from_snapshot(void *buf, fuse_fill_dir_t filler,
-					     GPtrArray *dir)
-{
-	struct cache_dirent **cdent;
-
-	for (cdent = (struct cache_dirent **) dir->pdata; *cdent != NULL; cdent++) {
-		if (filler(buf, (*cdent)->name, &(*cdent)->stat, 0,
-			   (*cdent)->flags))
-			break;
-	}
-}
-
-static void cache_readdir_cache_snapshot(const char *path, GPtrArray *dir,
-					 uint64_t wrctr)
-{
-	struct cache_dirent **cdent;
-
-	for (cdent = (struct cache_dirent **) dir->pdata; *cdent != NULL; cdent++) {
-		struct cache_dirent *entry = *cdent;
-		if (entry->stat.st_mode & S_IFMT) {
-			char *fullpath = cache_fullpath(path, entry->name);
-			cache_add_attr(fullpath, &entry->stat, wrctr);
-			g_free(fullpath);
-		}
-	}
-
-#ifdef __APPLE__
-	cache_seed_appledouble_negatives(path, dir, wrctr);
-#endif
-	cache_add_dir(path, dir);
-}
-
 static void *cache_init(struct fuse_conn_info *conn,
                         struct fuse_config *cfg)
 {
@@ -474,18 +423,25 @@ static int cache_dirfill (void *buf, const char *name,
 			  const struct stat *stbuf, off_t off,
 			  enum fuse_fill_dir_flags flags)
 {
+	int err;
 	struct readdir_handle *ch;
 
 	ch = (struct readdir_handle*) buf;
-	(void) off;
+	err = ch->filler(ch->buf, name, stbuf, off, flags);
+	if (!err) {
+		struct cache_dirent *cdent = g_malloc(sizeof(struct cache_dirent));
+		cdent->name = g_strdup(name);
+		cdent->stat = *stbuf;
+		g_ptr_array_add(ch->dir, cdent);
+		if (stbuf->st_mode & S_IFMT) {
+			char *fullpath;
 
-	struct cache_dirent *cdent = g_malloc(sizeof(struct cache_dirent));
-	cdent->name = g_strdup(name);
-	cdent->stat = *stbuf;
-	cdent->flags = flags;
-	g_ptr_array_add(ch->dir, cdent);
-
-	return 0;
+			fullpath = cache_fullpath(ch->path, name);
+			cache_add_attr(fullpath, stbuf, ch->wrctr);
+			g_free(fullpath);
+		}
+	}
+	return err;
 }
 
 static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -497,9 +453,7 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	int err;
 	GPtrArray *dir;
 	struct node *node;
-	int retries = 0;
-	const int max_retries = 3;
-	int stable_snapshot = 0;
+	struct cache_dirent **cdent;
 
 	assert(offset == 0);
 
@@ -508,7 +462,9 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if (node != NULL && node->dir != NULL) {
 		time_t now = time(NULL);
 		if (node->dir_valid - now >= 0) {
-			cache_readdir_fill_from_snapshot(buf, filler, node->dir);
+			for(cdent = (struct cache_dirent**)node->dir->pdata; *cdent != NULL; cdent++) {
+				filler(buf, (*cdent)->name, &(*cdent)->stat, 0, 0);
+      }
 			pthread_mutex_unlock(&cache.lock);
 			return 0;
 		}
@@ -528,36 +484,22 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		cfi->fs_fh = fi->fh;
 	}
 
-	for (;;) {
-		ch.path = path;
-		ch.dir = g_ptr_array_new();
-		g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
-		ch.wrctr = cache_get_write_ctr();
-		ch.namespace_ctr = cache_get_namespace_ctr();
-		err = cache.next_oper->readdir(path, &ch, cache_dirfill, offset, fi,
-					      flags);
-		g_ptr_array_add(ch.dir, NULL);
-		dir = ch.dir;
-		if (err) {
-			g_ptr_array_free(dir, TRUE);
-			return err;
-		}
-		if (!cache_readdir_snapshot_changed(ch.namespace_ctr)) {
-			stable_snapshot = 1;
-			break;
-		}
-		if (retries >= max_retries)
-			break;
-		g_ptr_array_free(dir, TRUE);
-		retries++;
-	}
-
+	ch.path = path;
+	ch.buf = buf;
+	ch.filler = filler;
+	ch.dir = g_ptr_array_new();
+	g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
+	ch.wrctr = cache_get_write_ctr();
+	err = cache.next_oper->readdir(path, &ch, cache_dirfill, offset, fi, flags);
+	g_ptr_array_add(ch.dir, NULL);
+	dir = ch.dir;
 	if (!err) {
-		if (stable_snapshot)
-			cache_readdir_cache_snapshot(path, dir, ch.wrctr);
-		cache_readdir_fill_from_snapshot(buf, filler, dir);
-		if (!stable_snapshot)
-			g_ptr_array_free(dir, TRUE);
+#ifdef __APPLE__
+		cache_seed_appledouble_negatives(path, dir, ch.wrctr);
+#endif
+		cache_add_dir(path, dir);
+	} else {
+		g_ptr_array_free(dir, TRUE);
 	}
 
 	return err;
