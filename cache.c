@@ -444,6 +444,26 @@ static int cache_utime(const char *path, struct utimbuf *buf)
 	return err;
 }
 
+#if FUSE_VERSION >= 26
+static int cache_utimens(const char *path, const struct timespec tv[2])
+{
+	int err = cache.next_oper->oper.utimens(path, tv);
+	if (!err)
+		cache_invalidate(path);
+	return err;
+}
+#endif
+
+#ifdef __APPLE__
+static int cache_setattr_x(const char *path, struct setattr_x *attr)
+{
+	int err = cache.next_oper->oper.setattr_x(path, attr);
+	if (!err)
+		cache_invalidate(path);
+	return err;
+}
+#endif
+
 static int cache_write(const char *path, const char *buf, size_t size,
                        off_t offset, struct fuse_file_info *fi)
 {
@@ -507,6 +527,10 @@ static void cache_unity_fill(struct fuse_cache_operations *oper,
 	cache_oper->chown       = oper->oper.chown;
 	cache_oper->truncate    = oper->oper.truncate;
 	cache_oper->utime       = oper->oper.utime;
+#if FUSE_VERSION >= 26
+	cache_oper->utimens     = oper->oper.utimens;
+	cache_oper->flag_utime_omit_ok = oper->oper.flag_utime_omit_ok;
+#endif
 	cache_oper->open        = oper->oper.open;
 	cache_oper->read        = oper->oper.read;
 	cache_oper->write       = oper->oper.write;
@@ -527,6 +551,9 @@ static void cache_unity_fill(struct fuse_cache_operations *oper,
 	cache_oper->flag_nullpath_ok = oper->oper.flag_nullpath_ok;
 	cache_oper->flag_nopath  = oper->oper.flag_nopath;
 #endif
+#ifdef __APPLE__
+	cache_oper->setattr_x   = oper->oper.setattr_x;
+#endif
 }
 
 static void cache_fill(struct fuse_cache_operations *oper,
@@ -546,6 +573,10 @@ static void cache_fill(struct fuse_cache_operations *oper,
 	cache_oper->chown    = oper->oper.chown ? cache_chown : NULL;
 	cache_oper->truncate = oper->oper.truncate ? cache_truncate : NULL;
 	cache_oper->utime    = oper->oper.utime ? cache_utime : NULL;
+#if FUSE_VERSION >= 26
+	cache_oper->utimens  = oper->oper.utimens ? cache_utimens : NULL;
+	cache_oper->flag_utime_omit_ok = oper->oper.flag_utime_omit_ok;
+#endif
 	cache_oper->write    = oper->oper.write ? cache_write : NULL;
 #if FUSE_VERSION >= 25
 	cache_oper->create   = oper->oper.create ? cache_create : NULL;
@@ -555,6 +586,9 @@ static void cache_fill(struct fuse_cache_operations *oper,
 #if FUSE_VERSION >= 29
 	cache_oper->flag_nullpath_ok = 0;
 	cache_oper->flag_nopath = 0;
+#endif
+#ifdef __APPLE__
+	cache_oper->setattr_x = oper->oper.setattr_x ? cache_setattr_x : NULL;
 #endif
 
 }

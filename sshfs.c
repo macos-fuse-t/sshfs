@@ -39,6 +39,7 @@
 #include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <glib.h>
@@ -2494,19 +2495,116 @@ static int sshfs_truncate(const char *path, off_t size)
 	return err;
 }
 
-static int sshfs_utime(const char *path, struct utimbuf *ubuf)
+static int sshfs_set_acmodtime(const char *path, time_t actime, time_t modtime)
 {
 	int err;
 	struct buffer buf;
+
 	buf_init(&buf, 0);
 	buf_add_path(&buf, path);
 	buf_add_uint32(&buf, SSH_FILEXFER_ATTR_ACMODTIME);
-	buf_add_uint32(&buf, ubuf->actime);
-	buf_add_uint32(&buf, ubuf->modtime);
+	buf_add_uint32(&buf, actime);
+	buf_add_uint32(&buf, modtime);
 	err = sftp_request(SSH_FXP_SETSTAT, &buf, SSH_FXP_STATUS, NULL);
 	buf_free(&buf);
 	return err;
 }
+
+static int sshfs_utime(const char *path, struct utimbuf *ubuf)
+{
+	return sshfs_set_acmodtime(path, ubuf->actime, ubuf->modtime);
+}
+
+#if FUSE_VERSION >= 26
+static void sshfs_timespec_to_time(const struct timespec *tv, time_t now,
+                                   time_t *out)
+{
+	if (tv->tv_nsec == UTIME_NOW)
+		*out = now;
+	else
+		*out = tv->tv_sec;
+}
+
+static int sshfs_utimens(const char *path, const struct timespec tv[2])
+{
+	int err;
+	struct stat stbuf;
+	time_t now = time(NULL);
+	time_t actime;
+	time_t modtime;
+
+	if (tv[0].tv_nsec == UTIME_OMIT && tv[1].tv_nsec == UTIME_OMIT)
+		return 0;
+
+	if (tv[0].tv_nsec == UTIME_OMIT || tv[1].tv_nsec == UTIME_OMIT) {
+		err = sshfs_getattr(path, &stbuf);
+		if (err)
+			return err;
+	}
+
+	if (tv[0].tv_nsec == UTIME_OMIT)
+		actime = stbuf.st_atime;
+	else
+		sshfs_timespec_to_time(&tv[0], now, &actime);
+
+	if (tv[1].tv_nsec == UTIME_OMIT)
+		modtime = stbuf.st_mtime;
+	else
+		sshfs_timespec_to_time(&tv[1], now, &modtime);
+
+	return sshfs_set_acmodtime(path, actime, modtime);
+}
+#endif
+
+#ifdef __APPLE__
+static int sshfs_setattr_x_common(const char *path, struct setattr_x *attr)
+{
+	int err;
+
+	if (SETATTR_WANTS_MODE(attr)) {
+		err = sshfs_chmod(path, attr->mode);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_UID(attr) || SETATTR_WANTS_GID(attr)) {
+		uid_t uid = SETATTR_WANTS_UID(attr) ? attr->uid : (uid_t) -1;
+		gid_t gid = SETATTR_WANTS_GID(attr) ? attr->gid : (gid_t) -1;
+
+		err = sshfs_chown(path, uid, gid);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_SIZE(attr)) {
+		err = sshfs_truncate(path, attr->size);
+		if (err)
+			return err;
+	}
+
+	if (SETATTR_WANTS_ACCTIME(attr) || SETATTR_WANTS_MODTIME(attr)) {
+		struct timespec tv[2];
+
+		tv[0] = attr->acctime;
+		tv[1] = attr->modtime;
+		if (!SETATTR_WANTS_ACCTIME(attr))
+			tv[0].tv_nsec = UTIME_OMIT;
+		if (!SETATTR_WANTS_MODTIME(attr))
+			tv[1].tv_nsec = UTIME_OMIT;
+
+		err = sshfs_utimens(path, tv);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int sshfs_setattr_x(const char *path, struct setattr_x *attr)
+{
+	return sshfs_setattr_x_common(path, attr);
+}
+#endif
 
 static inline int sshfs_file_is_conn(struct sshfs_file *sf)
 {
@@ -3369,6 +3467,10 @@ static struct fuse_cache_operations sshfs_oper = {
 		.chown      = sshfs_chown,
 		.truncate   = sshfs_truncate,
 		.utime      = sshfs_utime,
+#if FUSE_VERSION >= 26
+		.utimens    = sshfs_utimens,
+		.flag_utime_omit_ok = 1,
+#endif
 		.open       = sshfs_open,
 		.flush      = sshfs_flush,
 		.fsync      = sshfs_fsync,
@@ -3384,6 +3486,9 @@ static struct fuse_cache_operations sshfs_oper = {
 #if FUSE_VERSION >= 29
 		.flag_nullpath_ok = 1,
 		.flag_nopath = 1,
+#endif
+#ifdef __APPLE__
+		.setattr_x  = sshfs_setattr_x,
 #endif
 	},
 	.cache_getdir = sshfs_getdir,
